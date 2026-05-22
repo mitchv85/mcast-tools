@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mcast-tools"
+version = "0.1.0"
+description = "Friendly multicast send/receive tools for lab environments"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [
+    { name = "Mitch Vaughan", email = "mitch.vaughan@gmail.com" }
+]
+requires-python = ">=3.10"
+dependencies = [
+    "rich>=13.0",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: System :: Networking",
+]
+
+[project.scripts]
+mcast-send = "mcast_tools.sender:main"
+mcast-receive = "mcast_tools.receiver:main"
+mcast-status = "mcast_tools.status:main"
+
+[project.urls]
+Homepage = "https://github.com/mitchv85/mcast-tools"
+Issues = "https://github.com/mitchv85/mcast-tools/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
