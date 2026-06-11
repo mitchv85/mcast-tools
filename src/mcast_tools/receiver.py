@@ -678,7 +678,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     source_ip: Optional[str] = None
     if source_arg:
         try:
-            source_addr = validate_source(source_arg)
+            source_addr = validate_source(source_arg, group_addr)
         except ValueError as e:
             console.print(f"[red]error:[/] {e}")
             return 2
