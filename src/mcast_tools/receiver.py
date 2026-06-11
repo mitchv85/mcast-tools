@@ -1,11 +1,11 @@
 """mcast-receive — friendly multicast receiver with live dashboard.
 
-Joins a multicast group (ASM or SSM), optionally forces IGMP version,
-and renders a live rich dashboard showing:
-- Join interface and IGMP version (forced and observed)
+Joins an IPv4 or IPv6 multicast group (ASM or SSM), optionally forces the
+IGMP/MLD version, and renders a live rich dashboard showing:
+- Join interface and IGMP/MLD version (forced and, for IGMP, observed)
 - Receive status (RECEIVING / STALLED) and last-packet age
 - Current pps and total counts
-- Received TTL vs sender-stamped original TTL (hop count!)
+- Received TTL/hop limit vs sender-stamped original (hop count!)
 - Received DSCP vs sender-stamped original DSCP (remark detection!)
 - Loss / duplicate / reorder counters via embedded sequence numbers
 - Sender restart detection via embedded sender_id
@@ -14,10 +14,12 @@ Usage:
     mcast-receive <group>
     mcast-receive <group> --source <source_ip>
     mcast-receive 239.0.10.101 --source 10.1.1.1 --igmp-version 3
+    mcast-receive ff3e::8000:1 --source 2001:db8::5 --interface eth1
 """
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import os
 import socket
@@ -38,6 +40,7 @@ from rich.text import Text
 from . import __version__
 from .common import (
     HEADER_SIZE,
+    MCAST_JOIN_SOURCE_GROUP,
     PacketHeader,
     RouteInfo,
     classify_multicast_group,
@@ -48,12 +51,18 @@ from .common import (
     fmt_pps,
     get_interface_igmp_version,
     is_ssm_group,
+    needs_explicit_interface,
+    pack_group_source_req,
+    pack_ipv6_mreq,
     parse_proc_net_igmp,
     read_force_igmp_version,
+    read_force_mld_version,
     require_root_or_warn,
+    split_scope,
     validate_multicast_group,
     validate_source,
     write_force_igmp_version,
+    write_force_mld_version,
 )
 
 
@@ -68,9 +77,21 @@ IP_MULTICAST_ALL = getattr(socket, "IP_MULTICAST_ALL", 49)
 CMSG_IP_TTL = 2
 CMSG_IP_TOS = 1
 
+# IPv6 siblings (RFC 3542 ancillary data; Linux values via getattr fallback)
+IPV6_RECVHOPLIMIT = getattr(socket, "IPV6_RECVHOPLIMIT", 51)
+IPV6_RECVTCLASS = getattr(socket, "IPV6_RECVTCLASS", 66)
+# Available since kernel 4.20 — the IPv6 analog of IP_MULTICAST_ALL
+IPV6_MULTICAST_ALL = getattr(socket, "IPV6_MULTICAST_ALL", 29)
+# cmsg_type values for received hop limit / traffic class — both carry a
+# native 4-byte int (unlike v4's 1-byte TOS cmsg)
+CMSG_IPV6_HOPLIMIT = 52
+CMSG_IPV6_TCLASS = 67
+
 MCAST_PORT = 0x4D43  # 19779, matches sender
 DEFAULT_STALL_TIMEOUT = 3.0  # seconds
 DEFAULT_IGMP_VERSION = 3
+# MLDv1 ≈ IGMPv2 (ASM only); MLDv2 ≈ IGMPv3 (adds SSM). No MLD analog of IGMPv1.
+DEFAULT_MLD_VERSION = 2
 SLIDING_WINDOW = 5.0
 RECV_BUF_BYTES = 65535
 
@@ -170,10 +191,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="mcast-receive",
         description=(
-            "Join an IPv4 multicast group and report reception in real time. "
-            "Detects sender-stamped original TTL/DSCP for hop count and "
-            "remark visibility. Detects loss, duplicates, reordering, gaps, "
-            "and sender restarts via embedded sequence/ID metadata."
+            "Join an IPv4 or IPv6 multicast group and report reception in "
+            "real time. Detects sender-stamped original TTL/hop-limit and "
+            "DSCP for hop count and remark visibility. Detects loss, "
+            "duplicates, reordering, gaps, and sender restarts via embedded "
+            "sequence/ID metadata."
         ),
         epilog=(
             "Examples:\n"
@@ -181,15 +203,23 @@ def build_parser() -> argparse.ArgumentParser:
             "  mcast-receive 239.0.10.101 --source 10.1.1.1\n"
             "  mcast-receive 232.5.5.5 --source 10.1.1.1 --igmp-version 3\n"
             "  mcast-receive 239.0.10.101 --igmp-version 2 --interface eth1\n"
+            "  mcast-receive ff3e::8000:1 --source 2001:db8::5 --interface eth1\n"
+            "  mcast-receive ff02::42%eth1     (link-local — zone names the interface)\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("group", help="IPv4 multicast group address")
+    parser.add_argument(
+        "group",
+        help=(
+            "Multicast group address — IPv4 (e.g. 239.0.10.101) or IPv6 "
+            "(e.g. ff3e::8000:1; link-local groups may carry a %%zone)"
+        ),
+    )
     parser.add_argument(
         "source",
         nargs="?",
         default=None,
-        help="Source IP for SSM (S,G) join. Optional.",
+        help="Source IP for SSM (S,G) join. Optional. Same family as group.",
     )
     parser.add_argument(
         "igmp_version",
@@ -197,7 +227,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         choices=[1, 2, 3],
-        help=f"IGMP version (1/2/3). Default: {DEFAULT_IGMP_VERSION}",
+        help=(
+            f"Protocol version — IGMP 1/2/3 for IPv4 groups "
+            f"(default {DEFAULT_IGMP_VERSION}), MLD 1/2 for IPv6 groups "
+            f"(default {DEFAULT_MLD_VERSION})"
+        ),
     )
     parser.add_argument(
         "--source", "-S",
@@ -209,7 +243,17 @@ def build_parser() -> argparse.ArgumentParser:
         dest="igmp_version_flag",
         type=int,
         choices=[1, 2, 3],
-        help="Same as positional igmp_version (flag form)",
+        help="IGMP version for IPv4 groups (flag form)",
+    )
+    parser.add_argument(
+        "--mld-version",
+        dest="mld_version_flag",
+        type=int,
+        choices=[1, 2],
+        help=(
+            "MLD version for IPv6 groups. MLDv1 ≈ IGMPv2 (ASM only), "
+            f"MLDv2 ≈ IGMPv3 (adds SSM). Default: {DEFAULT_MLD_VERSION}"
+        ),
     )
     parser.add_argument(
         "--interface", "-i",
@@ -303,6 +347,68 @@ def setup_receiver_socket(
             socket.inet_aton(iface_addr),
         )
         sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+
+    return sock
+
+
+def setup_receiver_socket_v6(
+    group_addr: ipaddress.IPv6Address,
+    source: Optional[str],
+    ifindex: Optional[int],
+) -> socket.socket:
+    """IPv6 sibling of setup_receiver_socket.
+
+    Key differences from v4: ancillary options live at IPPROTO_IPV6 and
+    carry int-sized cmsgs; the join interface is an *index*, not an
+    address; ASM joins use struct ipv6_mreq via IPV6_JOIN_GROUP; and SSM
+    joins have no IPV6_ADD_SOURCE_MEMBERSHIP — they go through the
+    protocol-independent MCAST_JOIN_SOURCE_GROUP with a hand-packed
+    struct group_source_req (see common.pack_group_source_req).
+    """
+    unscoped, _zone = split_scope(group_addr)
+    idx = ifindex or 0
+
+    sock = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    except (AttributeError, OSError):
+        pass
+
+    # Don't deliver multicast traffic for groups we haven't explicitly
+    # joined (kernel 4.20+; best-effort on older kernels)
+    try:
+        sock.setsockopt(socket.IPPROTO_IPV6, IPV6_MULTICAST_ALL, 0)
+    except OSError:
+        pass
+
+    # Enable per-packet hop limit and traffic class in ancillary data
+    try:
+        sock.setsockopt(socket.IPPROTO_IPV6, IPV6_RECVHOPLIMIT, 1)
+    except OSError:
+        pass
+    try:
+        sock.setsockopt(socket.IPPROTO_IPV6, IPV6_RECVTCLASS, 1)
+    except OSError:
+        pass
+
+    # Bind to the group address + port — same dest-filtering trick as v4.
+    # The 4-tuple's scope_id matters for link-local groups.
+    sock.bind((str(unscoped), MCAST_PORT, 0, idx))
+
+    if source:
+        # SSM: (S,G) join via MCAST_JOIN_SOURCE_GROUP + group_source_req
+        gsr = pack_group_source_req(
+            idx,
+            unscoped,
+            ipaddress.IPv6Address(source),
+            group_scope_id=idx,
+        )
+        sock.setsockopt(socket.IPPROTO_IPV6, MCAST_JOIN_SOURCE_GROUP, gsr)
+    else:
+        # ASM: (*,G) join via IPV6_JOIN_GROUP + ipv6_mreq
+        mreq = pack_ipv6_mreq(unscoped, idx)
+        sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_JOIN_GROUP, mreq)
 
     return sock
 
@@ -422,6 +528,32 @@ def check_stall(stats: ReceiverStats, stall_timeout: float) -> None:
 # Receive loop
 # ---------------------------------------------------------------------------
 
+def parse_ancillary(ancdata: list) -> "tuple[Optional[int], Optional[int]]":
+    """Extract (recv_ttl, recv_tos) from recvmsg ancillary data, both families.
+
+    IPv4 (IPPROTO_IP): IP_TTL cmsg carries a native int; IP_TOS carries a
+    single byte. IPv6 (IPPROTO_IPV6): IPV6_HOPLIMIT and IPV6_TCLASS each
+    carry a native int (RFC 3542). The hop limit maps onto recv_ttl and the
+    traffic class onto recv_tos — same byte layout, so downstream DSCP
+    decoding is family-agnostic. A socket only ever delivers its own
+    family's cmsgs; handling both levels here keeps recv_loop family-blind.
+    """
+    recv_ttl: Optional[int] = None
+    recv_tos: Optional[int] = None
+    for cmsg_level, cmsg_type, cmsg_data in ancdata:
+        if cmsg_level == socket.IPPROTO_IP:
+            if cmsg_type == CMSG_IP_TTL and len(cmsg_data) >= 4:
+                recv_ttl = struct.unpack("=i", cmsg_data[:4])[0]
+            elif cmsg_type == CMSG_IP_TOS and len(cmsg_data) >= 1:
+                recv_tos = cmsg_data[0]
+        elif cmsg_level == socket.IPPROTO_IPV6:
+            if cmsg_type == CMSG_IPV6_HOPLIMIT and len(cmsg_data) >= 4:
+                recv_ttl = struct.unpack("=i", cmsg_data[:4])[0]
+            elif cmsg_type == CMSG_IPV6_TCLASS and len(cmsg_data) >= 4:
+                recv_tos = struct.unpack("=i", cmsg_data[:4])[0]
+    return recv_ttl, recv_tos
+
+
 def recv_loop(
     sock: socket.socket,
     stats: ReceiverStats,
@@ -447,15 +579,7 @@ def recv_loop(
             check_stall(stats, stall_timeout)
             continue
 
-        recv_ttl: Optional[int] = None
-        recv_tos: Optional[int] = None
-        for cmsg_level, cmsg_type, cmsg_data in ancdata:
-            if cmsg_level != socket.IPPROTO_IP:
-                continue
-            if cmsg_type == CMSG_IP_TTL and len(cmsg_data) >= 4:
-                recv_ttl = struct.unpack("=i", cmsg_data[:4])[0]
-            elif cmsg_type == CMSG_IP_TOS and len(cmsg_data) >= 1:
-                recv_tos = cmsg_data[0]
+        recv_ttl, recv_tos = parse_ancillary(ancdata)
 
         process_packet(data, src_addr, recv_ttl, recv_tos, stats, stall_timeout)
         check_stall(stats, stall_timeout)
@@ -477,6 +601,8 @@ def render_dashboard(
     stats: ReceiverStats,
     stall_timeout: float,
     running: bool,
+    proto_label: str = "IGMP",
+    observed_note: str = "observed: unknown",
 ) -> Panel:
     cfg = Table.grid(padding=(0, 2))
     cfg.add_column(style="dim", no_wrap=True)
@@ -503,8 +629,8 @@ def render_dashboard(
                 f"v{requested_igmp} requested, [yellow]operating as {observed_igmp}[/]"
             )
     else:
-        igmp_str = f"v{requested_igmp} requested  [dim](observed: unknown)[/]"
-    cfg.add_row("IGMP version:", igmp_str)
+        igmp_str = f"v{requested_igmp} requested  [dim]({observed_note})[/]"
+    cfg.add_row(f"{proto_label} version:", igmp_str)
 
     # ----- live section -----
     live = Table.grid(padding=(0, 2))
@@ -684,86 +810,195 @@ def main(argv: Optional[list[str]] = None) -> int:
             return 2
         source_ip = str(source_addr)
 
-    # ---- Resolve IGMP version --------------------------------------------
-    igmp_version = (
-        args.igmp_version_flag
-        if args.igmp_version_flag is not None
-        else args.igmp_version
-    )
-    if igmp_version is None:
-        igmp_version = DEFAULT_IGMP_VERSION
+    is_v6 = isinstance(group_addr, ipaddress.IPv6Address)
+    proto_label = "MLD" if is_v6 else "IGMP"
+    group_host = str(group_addr)
+    zone: Optional[str] = None
+    if is_v6:
+        _unscoped, zone = split_scope(group_addr)
+        group_host = str(_unscoped)
 
-    # SSM requires v3
-    if source_ip and igmp_version != 3:
+    # ---- Resolve protocol version (IGMP for v4, MLD for v6) ---------------
+    if is_v6 and args.igmp_version_flag is not None:
+        console.print(
+            "[red]error:[/] --igmp-version is for IPv4 groups. IPv6 uses MLD "
+            "— the IPv6 sibling of IGMP (MLDv1 ≈ IGMPv2, MLDv2 ≈ IGMPv3). "
+            "Use --mld-version 1|2 instead."
+        )
+        return 2
+    if not is_v6 and args.mld_version_flag is not None:
+        console.print(
+            "[red]error:[/] --mld-version is for IPv6 groups. This is an "
+            "IPv4 group — use --igmp-version 1|2|3 instead (IGMP is IPv4's "
+            "membership protocol; MLD is IPv6's)."
+        )
+        return 2
+
+    if is_v6:
+        mld_version = (
+            args.mld_version_flag
+            if args.mld_version_flag is not None
+            else args.igmp_version  # positional version slot
+        )
+        if mld_version == 3:
+            console.print(
+                "[red]error:[/] MLD only has versions 1 and 2 — MLDv1 maps "
+                "to IGMPv2 (ASM only) and MLDv2 maps to IGMPv3 (adds SSM "
+                "source filtering). There is no MLD analog of IGMPv1. For "
+                "SSM, use MLDv2."
+            )
+            return 2
+        if mld_version is None:
+            mld_version = DEFAULT_MLD_VERSION
+        version = mld_version
+    else:
+        igmp_version = (
+            args.igmp_version_flag
+            if args.igmp_version_flag is not None
+            else args.igmp_version
+        )
+        if igmp_version is None:
+            igmp_version = DEFAULT_IGMP_VERSION
+        version = igmp_version
+
+    # SSM requires the source-filtering-capable version of each protocol
+    if source_ip and not is_v6 and version != 3:
         console.print(
             f"[red]error:[/] source-specific (SSM) joins require IGMPv3, "
-            f"got v{igmp_version}. Reason: only IGMPv3 Membership Reports carry "
+            f"got v{version}. Reason: only IGMPv3 Membership Reports carry "
             "the (S,G) state needed for source filtering. Drop --igmp-version "
             "or set it to 3."
         )
         return 2
+    if source_ip and is_v6 and version != 2:
+        console.print(
+            f"[red]error:[/] source-specific (SSM) joins require MLDv2, "
+            f"got v{version}. Reason: only MLDv2 Reports carry the (S,G) "
+            "source lists — exactly like IGMPv3 for IPv4. Drop --mld-version "
+            "or set it to 2."
+        )
+        return 2
 
     # SSM group without source is unusual — warn (but allow; this exercises
-    # things like the kernel falling back to (*,G) on a 232/8 group)
+    # things like the kernel falling back to (*,G) on the SSM range)
     if is_ssm_group(group_addr) and not source_ip:
+        ssm_range = "ff3x::/32 (the IPv6 SSM range)" if is_v6 else "232.0.0.0/8"
         console.print(
-            f"[yellow]warning:[/] {group_addr} is in the SSM range (232.0.0.0/8) "
+            f"[yellow]warning:[/] {group_host} is in the SSM range ({ssm_range}) "
             "but no source specified. Most networks ignore (*,G) joins on this range."
         )
 
     # ---- Resolve interface ------------------------------------------------
     iface_name = args.interface
     iface_ip: Optional[str] = None
-    if iface_name:
-        from .sender import get_interface_ip
-        iface_ip = get_interface_ip(iface_name)
-        if iface_ip is None:
+    ifindex: Optional[int] = None
+    if is_v6:
+        if zone and iface_name and zone != iface_name:
             console.print(
-                f"[yellow]warning:[/] could not resolve IPv4 address for {iface_name}"
+                f"[red]error:[/] group zone %{zone} conflicts with "
+                f"--interface {iface_name} — pick one"
             )
-    else:
-        route = RouteInfo.for_destination(str(group_addr))
-        if route is not None:
-            iface_name = route.interface
-            iface_ip = route.src_addr
-
-    # ---- Force IGMP version ----------------------------------------------
-    saved_igmp: Optional[int] = None
-    igmp_forced = False
-    if iface_name:
-        saved_igmp = read_force_igmp_version(iface_name)
-        if saved_igmp is None:
+            return 2
+        iface_name = iface_name or zone
+        if iface_name:
+            try:
+                ifindex = socket.if_nametoindex(iface_name)
+            except OSError:
+                console.print(
+                    f"[red]error:[/] interface '{iface_name}' not found"
+                )
+                return 2
+            from .sender import get_interface_ipv6
+            iface_ip = get_interface_ipv6(iface_name)
+            if iface_ip is None:
+                console.print(
+                    f"[yellow]warning:[/] could not resolve an IPv6 address "
+                    f"for {iface_name}"
+                )
+        else:
+            route = RouteInfo.for_destination(group_host)
+            if route is not None:
+                iface_name = route.interface
+                iface_ip = route.src_addr
+                try:
+                    ifindex = socket.if_nametoindex(iface_name)
+                except OSError:
+                    ifindex = None
+        if needs_explicit_interface(group_addr) and not ifindex:
             console.print(
-                f"[yellow]warning:[/] cannot read force_igmp_version for "
-                f"{iface_name} — IGMP version may not match requested v{igmp_version}"
+                f"[red]error:[/] {group_host} is interface-/link-local scope — "
+                "the kernel needs an interface to join on. Use a %zone "
+                f"({group_host}%eth1) or --interface."
+            )
+            return 2
+    else:
+        if iface_name:
+            from .sender import get_interface_ip
+            iface_ip = get_interface_ip(iface_name)
+            if iface_ip is None:
+                console.print(
+                    f"[yellow]warning:[/] could not resolve IPv4 address for {iface_name}"
+                )
+        else:
+            route = RouteInfo.for_destination(group_host)
+            if route is not None:
+                iface_name = route.interface
+                iface_ip = route.src_addr
+
+    # ---- Force IGMP/MLD version --------------------------------------------
+    read_force = read_force_mld_version if is_v6 else read_force_igmp_version
+    write_force = write_force_mld_version if is_v6 else write_force_igmp_version
+    saved_force: Optional[int] = None
+    version_forced = False
+    if iface_name:
+        saved_force = read_force(iface_name)
+        if saved_force is None:
+            console.print(
+                f"[yellow]warning:[/] cannot read force_{proto_label.lower()}_version "
+                f"for {iface_name} — {proto_label} version may not match "
+                f"requested v{version}"
             )
         else:
             if not require_root_or_warn(
-                f"forcing IGMPv{igmp_version} on {iface_name}"
+                f"forcing {proto_label}v{version} on {iface_name}"
             ):
                 pass
-            ok = write_force_igmp_version(iface_name, igmp_version)
+            ok = write_force(iface_name, version)
             if ok:
-                igmp_forced = True
-            elif saved_igmp != igmp_version:
+                version_forced = True
+            elif saved_force != version:
                 console.print(
-                    f"[yellow]warning:[/] could not write force_igmp_version "
-                    f"on {iface_name} (need root). Continuing — kernel will use "
-                    f"its current setting (v{saved_igmp or '?'})."
+                    f"[yellow]warning:[/] could not write "
+                    f"force_{proto_label.lower()}_version on {iface_name} "
+                    f"(need root). Continuing — kernel will use its current "
+                    f"setting (v{saved_force or 'auto'})."
                 )
 
     # ---- Set up socket and join ------------------------------------------
     try:
-        sock = setup_receiver_socket(
-            group=str(group_addr),
-            source=source_ip,
-            interface_ip=iface_ip,
-        )
+        if is_v6:
+            sock = setup_receiver_socket_v6(
+                group_addr=group_addr,
+                source=source_ip,
+                ifindex=ifindex,
+            )
+        else:
+            sock = setup_receiver_socket(
+                group=group_host,
+                source=source_ip,
+                interface_ip=iface_ip,
+            )
     except OSError as e:
         console.print(f"[red]socket/join failed:[/] {e}")
-        if igmp_forced and saved_igmp is not None and iface_name:
-            write_force_igmp_version(iface_name, saved_igmp)
+        if version_forced and saved_force is not None and iface_name:
+            write_force(iface_name, saved_force)
         return 1
+
+    observed_note = (
+        "operational MLD version isn't exposed by the kernel"
+        if is_v6
+        else "observed: unknown"
+    )
 
     join_type = (
         f"(S,G) — SSM — source {source_ip}" if source_ip else "(*,G) — ASM"
@@ -781,9 +1016,9 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     if args.quiet:
         console.print(
-            f"mcast-receive: joining {group_addr}"
+            f"mcast-receive: joining {group_host}"
             + (f" source {source_ip}" if source_ip else "")
-            + f" on {iface_name or 'routing default'} as IGMPv{igmp_version}"
+            + f" on {iface_name or 'routing default'} as {proto_label}v{version}"
         )
 
     recv_thread = threading.Thread(
@@ -806,19 +1041,23 @@ def main(argv: Optional[list[str]] = None) -> int:
         else:
             with Live(
                 render_dashboard(
-                    group=str(group_addr),
+                    group=group_host,
                     group_class=group_class,
                     source=source_ip,
                     join_type=join_type,
                     interface=iface_name or "",
                     iface_ip=iface_ip,
-                    requested_igmp=igmp_version,
+                    requested_igmp=version,
                     observed_igmp=(
-                        get_interface_igmp_version(iface_name) if iface_name else None
+                        get_interface_igmp_version(iface_name)
+                        if iface_name and not is_v6
+                        else None
                     ),
                     stats=stats,
                     stall_timeout=args.stall_timeout,
                     running=True,
+                    proto_label=proto_label,
+                    observed_note=observed_note,
                 ),
                 console=console,
                 refresh_per_second=4,
@@ -827,38 +1066,41 @@ def main(argv: Optional[list[str]] = None) -> int:
                 while recv_thread.is_alive():
                     live.update(
                         render_dashboard(
-                            group=str(group_addr),
+                            group=group_host,
                             group_class=group_class,
                             source=source_ip,
                             join_type=join_type,
                             interface=iface_name or "",
                             iface_ip=iface_ip,
-                            requested_igmp=igmp_version,
+                            requested_igmp=version,
                             observed_igmp=(
                                 get_interface_igmp_version(iface_name)
-                                if iface_name
+                                if iface_name and not is_v6
                                 else None
                             ),
                             stats=stats,
                             stall_timeout=args.stall_timeout,
                             running=True,
+                            proto_label=proto_label,
+                            observed_note=observed_note,
                         )
                     )
                     recv_thread.join(timeout=0.25)
     finally:
         sock.close()
-        if igmp_forced and saved_igmp is not None and iface_name:
-            write_force_igmp_version(iface_name, saved_igmp)
+        if version_forced and saved_force is not None and iface_name:
+            write_force(iface_name, saved_force)
 
     # ---- Final summary ----------------------------------------------------
     if args.json:
         summary = {
             "tool": "mcast-receive",
             "version": __version__,
-            "group": str(group_addr),
+            "group": group_host,
+            "family": group_addr.version,
             "source": source_ip,
             "interface": iface_name,
-            "igmp_version_requested": igmp_version,
+            ("mld_version_requested" if is_v6 else "igmp_version_requested"): version,
             "elapsed_s": stats.elapsed(),
             "packets_recv": stats.packets_recv,
             "bytes_recv": stats.bytes_recv,
