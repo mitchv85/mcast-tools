@@ -971,7 +971,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                     f"[yellow]warning:[/] could not write "
                     f"force_{proto_label.lower()}_version on {iface_name} "
                     f"(need root). Continuing — kernel will use its current "
-                    f"setting (v{saved_force or 'auto'})."
+                    f"setting ({'auto' if not saved_force else f'v{saved_force}'})."
                 )
 
     # ---- Set up socket and join ------------------------------------------
