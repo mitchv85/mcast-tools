@@ -3,14 +3,17 @@
 Usage:
     mcast-send <group> [duration_seconds] [ttl]
     mcast-send <group> --rate 25pps --ttl 100 --duration 600
+    mcast-send ff3e::8000:1 --rate 1Mbps --dscp ef --interface eth1
 
-Reads command-line args, sets up an IPv4 UDP socket with the appropriate
-multicast options, and sends packets carrying a custom header at a steady
-rate. Renders a live rich dashboard with rate, byte counts, and config.
+Reads command-line args, sets up a UDP socket of the group's address
+family (IPv4 or IPv6) with the appropriate multicast options, and sends
+packets carrying a custom header at a steady rate. Renders a live rich
+dashboard with rate, byte counts, and config.
 """
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import os
 import secrets
 import socket
@@ -39,8 +42,10 @@ from .common import (
     fmt_pps,
     is_ssm_group,
     make_packet,
+    needs_explicit_interface,
     parse_dscp,
     parse_rate,
+    split_scope,
     tos_byte_from_dscp,
     validate_multicast_group,
 )
@@ -52,6 +57,11 @@ DEFAULT_RATE = "25pps"
 DEFAULT_SIZE = 200
 DEFAULT_DSCP = 0
 SLIDING_WINDOW = 5.0  # seconds for "current rate" calculation
+MCAST_PORT = 0x4D43  # 19779, "MC" — matches receiver
+
+# IPv6 traffic class — same DSCP layout as the v4 TOS byte. getattr in case
+# an exotic Python build doesn't expose it (Linux value: 67).
+IPV6_TCLASS = getattr(socket, "IPV6_TCLASS", 67)
 
 
 # ---------------------------------------------------------------------------
@@ -62,22 +72,28 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="mcast-send",
         description=(
-            "Send IPv4 multicast traffic to a group. Packets carry a custom "
-            "header (orig TTL, orig DSCP, sequence, timestamp) so a paired "
-            "mcast-receive can detect loss, duplicates, hop count, and DSCP "
-            "remarks."
+            "Send IPv4 or IPv6 multicast traffic to a group. Packets carry a "
+            "custom header (orig TTL/hop limit, orig DSCP, sequence, "
+            "timestamp) so a paired mcast-receive can detect loss, "
+            "duplicates, hop count, and DSCP remarks."
         ),
         epilog=(
             "Examples:\n"
             "  mcast-send 239.0.10.101\n"
             "  mcast-send 239.0.10.101 600 100\n"
             "  mcast-send 239.0.10.101 --rate 1Mbps --dscp ef --interface eth1\n"
+            "  mcast-send ff3e::8000:1 --rate 1Mbps --dscp ef --interface eth1\n"
+            "  mcast-send ff02::42%eth1     (link-local scope — zone names the interface)\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
         "group",
-        help="IPv4 multicast group address (e.g. 239.0.10.101)",
+        help=(
+            "Multicast group address — IPv4 (e.g. 239.0.10.101) or IPv6 "
+            "(e.g. ff3e::8000:1; link-local groups may carry a %%zone like "
+            "ff02::42%%eth1)"
+        ),
     )
     parser.add_argument(
         "duration",
@@ -91,7 +107,10 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="?",
         type=int,
         default=None,
-        help=f"IP TTL for outgoing packets. Default: {DEFAULT_TTL}",
+        help=(
+            f"IPv4 TTL / IPv6 hop limit for outgoing packets. "
+            f"Default: {DEFAULT_TTL}"
+        ),
     )
     parser.add_argument(
         "--duration", "-t",
@@ -100,10 +119,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Same as positional duration (overrides if both given)",
     )
     parser.add_argument(
-        "--ttl",
+        "--ttl", "--hop-limit",
         dest="ttl_flag",
         type=int,
-        help="Same as positional ttl (overrides if both given)",
+        help=(
+            "Same as positional ttl (overrides if both given). "
+            "--hop-limit is the IPv6-flavored alias."
+        ),
     )
     parser.add_argument(
         "--rate", "-r",
@@ -225,6 +247,31 @@ def setup_sender_socket(
     return sock
 
 
+def setup_sender_socket_v6(
+    hops: int,
+    dscp: int,
+    ifindex: Optional[int],
+    enable_loopback: bool,
+) -> socket.socket:
+    """IPv6 sibling of setup_sender_socket. Key differences from v4:
+    hop limit instead of TTL, traffic class instead of TOS, and
+    IPV6_MULTICAST_IF takes an interface *index*, not an address."""
+    sock = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_MULTICAST_HOPS, hops)
+    sock.setsockopt(
+        socket.IPPROTO_IPV6,
+        socket.IPV6_MULTICAST_LOOP,
+        1 if enable_loopback else 0,
+    )
+    # DSCP -> traffic class byte (same layout as the v4 TOS byte)
+    if dscp != 0:
+        sock.setsockopt(socket.IPPROTO_IPV6, IPV6_TCLASS, tos_byte_from_dscp(dscp))
+    # Egress interface override — by index for IPv6
+    if ifindex:
+        sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_MULTICAST_IF, ifindex)
+    return sock
+
+
 def get_interface_ip(interface: str) -> Optional[str]:
     """Look up the primary IPv4 address of an interface using `ip -j addr show`."""
     import json
@@ -253,6 +300,64 @@ def get_interface_ip(interface: str) -> Optional[str]:
     return None
 
 
+def _pick_v6_addr(addr_info: list) -> Optional[str]:
+    """Pick a display address from `ip -j -6 addr show` addr_info entries.
+
+    Prefers global scope (stable, routable) over link scope; ignores any
+    non-inet6 entries defensively.
+    """
+    link_fallback: Optional[str] = None
+    for a in addr_info:
+        if a.get("family") != "inet6":
+            continue
+        if a.get("scope") == "global":
+            return a.get("local")
+        if a.get("scope") == "link" and link_fallback is None:
+            link_fallback = a.get("local")
+    return link_fallback
+
+
+def get_interface_ipv6(interface: str) -> Optional[str]:
+    """Look up an IPv6 address of an interface (global preferred, link
+    fallback) using `ip -j -6 addr show`."""
+    import json
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["ip", "-j", "-6", "addr", "show", "dev", interface],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+    if not data:
+        return None
+    return _pick_v6_addr(data[0].get("addr_info", []))
+
+
+def make_send_dest(
+    group_addr: "ipaddress.IPv4Address | ipaddress.IPv6Address",
+    port: int,
+    ifindex: Optional[int],
+) -> tuple:
+    """Build the family-appropriate sendto destination.
+
+    IPv4 → (host, port). IPv6 → (host, port, flowinfo, scope_id); any
+    %zone on the group rides in the scope_id slot, never the host string.
+    """
+    if isinstance(group_addr, ipaddress.IPv6Address):
+        unscoped, _zone = split_scope(group_addr)
+        return (str(unscoped), port, 0, ifindex or 0)
+    return (str(group_addr), port)
+
+
 # ---------------------------------------------------------------------------
 # Dashboard rendering
 # ---------------------------------------------------------------------------
@@ -270,6 +375,7 @@ def render_dashboard(
     duration: int,
     stats: SenderStats,
     running: bool,
+    hop_label: str = "TTL",
 ) -> Panel:
     cfg = Table.grid(padding=(0, 2))
     cfg.add_column(style="dim", no_wrap=True)
@@ -280,7 +386,7 @@ def render_dashboard(
     if iface_ip:
         iface_str += f"  [dim]({iface_ip})[/]"
     cfg.add_row("Interface:", iface_str)
-    cfg.add_row("TTL:", str(ttl))
+    cfg.add_row(f"{hop_label}:", str(ttl))
     cfg.add_row("DSCP:", dscp_label(dscp))
     cfg.add_row("Datagram:", f"{datagram_size} bytes  [dim](header {HEADER_SIZE} + payload {datagram_size - HEADER_SIZE})[/]")
     cfg.add_row("Target rate:", f"{fmt_pps(target_pps)}  [dim]({fmt_bps(target_pps * datagram_size * 8)})[/]")
@@ -332,7 +438,7 @@ def render_dashboard(
 
 def send_loop(
     sock: socket.socket,
-    group: str,
+    dest: tuple,
     target_pps: float,
     datagram_size: int,
     ttl: int,
@@ -374,7 +480,7 @@ def send_loop(
                 orig_dscp=dscp,
                 datagram_size=datagram_size,
             )
-            sock.sendto(packet, (group, 0x4D43))  # port 0x4D43 = 19779, "MC"
+            sock.sendto(packet, dest)  # port 0x4D43 = 19779, "MC"
         except OSError as exc:
             stats.errors += 1
             # If the interface goes down etc., back off briefly
@@ -423,10 +529,17 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 2
 
     group_class = classify_multicast_group(group_addr)
-    if group_addr in __import__("ipaddress").IPv4Network("224.0.0.0/24"):
+    is_v6 = isinstance(group_addr, ipaddress.IPv6Address)
+    hop_label = "Hop limit" if is_v6 else "TTL"
+    if not is_v6 and group_addr in ipaddress.IPv4Network("224.0.0.0/24"):
         console.print(
             f"[yellow]warning:[/] {group_addr} is in 224.0.0.0/24 (link-local, "
             "not routed beyond the local link)."
+        )
+    if is_v6 and needs_explicit_interface(group_addr):
+        console.print(
+            f"[yellow]warning:[/] {group_addr} is interface-/link-local scope "
+            "(not routed beyond the local link)."
         )
 
     duration = args.duration_flag if args.duration_flag is not None else args.duration
@@ -440,7 +553,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     if ttl is None:
         ttl = DEFAULT_TTL
     if not 1 <= ttl <= 255:
-        console.print("[red]error:[/] ttl must be 1-255")
+        console.print(f"[red]error:[/] {hop_label.lower()} must be 1-255")
         return 2
 
     if args.size < HEADER_SIZE:
@@ -467,30 +580,84 @@ def main(argv: Optional[list[str]] = None) -> int:
     # ---- Resolve egress interface ----------------------------------------
     iface_name = args.interface
     iface_ip: Optional[str] = None
-    if iface_name:
-        iface_ip = get_interface_ip(iface_name)
-        if iface_ip is None:
+    ifindex: Optional[int] = None
+    group_host = str(group_addr)
+
+    if is_v6:
+        unscoped, zone = split_scope(group_addr)
+        group_host = str(unscoped)
+        if zone and iface_name and zone != iface_name:
             console.print(
-                f"[yellow]warning:[/] could not resolve IPv4 address for {iface_name}"
+                f"[red]error:[/] group zone %{zone} conflicts with "
+                f"--interface {iface_name} — pick one"
             )
+            return 2
+        iface_name = iface_name or zone
+        if iface_name:
+            try:
+                ifindex = socket.if_nametoindex(iface_name)
+            except OSError:
+                console.print(
+                    f"[red]error:[/] interface '{iface_name}' not found"
+                )
+                return 2
+            iface_ip = get_interface_ipv6(iface_name)
+            if iface_ip is None:
+                console.print(
+                    f"[yellow]warning:[/] could not resolve an IPv6 address "
+                    f"for {iface_name}"
+                )
+        else:
+            route = RouteInfo.for_destination(group_host)
+            if route is not None:
+                iface_name = route.interface
+                iface_ip = route.src_addr
+                try:
+                    ifindex = socket.if_nametoindex(iface_name)
+                except OSError:
+                    ifindex = None
+        if needs_explicit_interface(group_addr) and not ifindex:
+            console.print(
+                f"[red]error:[/] {group_host} is interface-/link-local scope — "
+                "the kernel needs an interface. Use a %zone "
+                f"({group_host}%eth1) or --interface."
+            )
+            return 2
     else:
-        route = RouteInfo.for_destination(str(group_addr))
-        if route is not None:
-            iface_name = route.interface
-            iface_ip = route.src_addr
+        if iface_name:
+            iface_ip = get_interface_ip(iface_name)
+            if iface_ip is None:
+                console.print(
+                    f"[yellow]warning:[/] could not resolve IPv4 address for {iface_name}"
+                )
+        else:
+            route = RouteInfo.for_destination(group_host)
+            if route is not None:
+                iface_name = route.interface
+                iface_ip = route.src_addr
 
     # ---- Set up socket ----------------------------------------------------
     try:
-        sock = setup_sender_socket(
-            group=str(group_addr),
-            ttl=ttl,
-            dscp=dscp,
-            interface_ip=iface_ip,
-            enable_loopback=not args.no_loopback,
-        )
+        if is_v6:
+            sock = setup_sender_socket_v6(
+                hops=ttl,
+                dscp=dscp,
+                ifindex=ifindex,
+                enable_loopback=not args.no_loopback,
+            )
+        else:
+            sock = setup_sender_socket(
+                group=group_host,
+                ttl=ttl,
+                dscp=dscp,
+                interface_ip=iface_ip,
+                enable_loopback=not args.no_loopback,
+            )
     except OSError as e:
         console.print(f"[red]socket setup failed:[/] {e}")
         return 1
+
+    dest = make_send_dest(group_addr, MCAST_PORT, ifindex)
 
     sender_id = secrets.randbits(32)
     stats = SenderStats()
@@ -506,8 +673,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     # Print one-time intro if quiet mode
     if args.quiet:
         console.print(
-            f"mcast-send: {group_addr} via {iface_name or 'routing default'} "
-            f"TTL={ttl} DSCP={dscp_label(dscp)} rate={fmt_pps(target_pps)} "
+            f"mcast-send: {group_host} via {iface_name or 'routing default'} "
+            f"{hop_label}={ttl} DSCP={dscp_label(dscp)} rate={fmt_pps(target_pps)} "
             f"size={args.size}B duration={duration}s"
         )
 
@@ -516,7 +683,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         target=send_loop,
         kwargs=dict(
             sock=sock,
-            group=str(group_addr),
+            dest=dest,
             target_pps=target_pps,
             datagram_size=args.size,
             ttl=ttl,
@@ -536,8 +703,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     else:
         with Live(
             render_dashboard(
-                group=str(group_addr),
+                group=group_host,
                 group_class=group_class,
+                hop_label=hop_label,
                 interface=iface_name or "",
                 iface_ip=iface_ip,
                 ttl=ttl,
@@ -556,8 +724,9 @@ def main(argv: Optional[list[str]] = None) -> int:
             while sender_thread.is_alive():
                 live.update(
                     render_dashboard(
-                        group=str(group_addr),
+                        group=group_host,
                         group_class=group_class,
+                        hop_label=hop_label,
                         interface=iface_name or "",
                         iface_ip=iface_ip,
                         ttl=ttl,
@@ -574,8 +743,9 @@ def main(argv: Optional[list[str]] = None) -> int:
             # Final frame with running=False
             live.update(
                 render_dashboard(
-                    group=str(group_addr),
+                    group=group_host,
                     group_class=group_class,
+                    hop_label=hop_label,
                     interface=iface_name or "",
                     iface_ip=iface_ip,
                     ttl=ttl,
@@ -597,7 +767,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         summary = {
             "tool": "mcast-send",
             "version": __version__,
-            "group": str(group_addr),
+            "group": group_host,
+            "family": group_addr.version,
             "interface": iface_name,
             "ttl": ttl,
             "dscp": dscp,

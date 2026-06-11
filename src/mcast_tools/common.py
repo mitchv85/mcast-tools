@@ -223,6 +223,22 @@ def _classify_v6(addr: ipaddress.IPv6Address) -> str:
     return f"{kind}, {scope_str}"
 
 
+def v6_scope_nibble(addr: ipaddress.IPv6Address) -> int:
+    """Return the RFC 4291 scope nibble (low nibble of byte 1) of a v6 group."""
+    unscoped, _zone = split_scope(addr)
+    return unscoped.packed[1] & 0xF
+
+
+def needs_explicit_interface(addr: ipaddress.IPv6Address) -> bool:
+    """True for interface-local (1) and link-local (2) scoped groups.
+
+    These never appear in the routing table in a useful way — the kernel
+    needs to be told which interface, via a %zone, --interface, or an
+    IPV6_MULTICAST_IF/scope_id we resolve ourselves.
+    """
+    return v6_scope_nibble(addr) in (0x1, 0x2)
+
+
 def classify_multicast_group(
     addr: "ipaddress.IPv4Address | ipaddress.IPv6Address",
 ) -> str:
