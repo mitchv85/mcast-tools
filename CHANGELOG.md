@@ -5,6 +5,23 @@ All notable changes to mcast-tools are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] — 2026-06-11
+
+### Added
+
+- **`mcast-send --source` / `-S`** — bind the outgoing source address,
+  both families. Removes RFC 6724 source-address selection from the
+  picture (the rules only apply to unbound sockets), making SSM (S,G)
+  demos deterministic when an interface carries multiple candidate
+  addresses (two same-prefix IPv6 globals; IPv4 secondaries/VIPs).
+  Validation reuses the receiver's SSM source checks — family matching,
+  %zone rejection — so `mcast-send G --source S` pairs naturally with
+  `mcast-receive G --source S`. Friendly error when the address isn't
+  assigned to the host. Dashboard shows a "Source: (bound)" row when
+  given; JSON gains a `"source"` field (null when unbound). Found in the
+  field during v0.2.0 lab verification, when the kernel sourced from a
+  SLAAC EUI-64 address one run and a static global the next.
+
 ## [0.2.0] — 2026-06-11
 
 IPv6 / MLD support across all three tools — paying off the limitation

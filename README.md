@@ -78,6 +78,7 @@ mcast-send <group> --rate 1Mbps --dscp ef --interface eth1
 | `--rate` | `25pps` | `Npps`, `Nkbps`, `NMbps`, etc. |
 | `--size` | `200` | Datagram size in bytes (header + payload) |
 | `--dscp` | `be` | `0`-`63` or name (`ef`, `af41`, `cs5`, ...) |
+| `--source` | (kernel-selected) | Bind the outgoing **source address**. Pin it for SSM demos — see below. |
 | `--interface` | (routing default) | Egress interface override |
 | `--no-loopback` | off | Disable `IP_MULTICAST_LOOP` |
 | `--quiet` / `--json` | off | Suppress dashboard / emit JSON summary on exit |
@@ -166,6 +167,18 @@ decrements TTL more than expected, you'll see it immediately.
 
 - **Family auto-detection.** The group address decides everything; there is
   no `--ipv6` flag. Sources must match the group's family.
+- **Pin the sender's source for SSM.** Without `--source`, the kernel picks
+  the source via RFC 6724 source-address selection — and when an interface
+  carries multiple same-prefix globals (say, a static address plus a SLAAC
+  EUI-64 from a router's RA), *every selection rule ties* and the pick is
+  unspecified. It can differ across runs. An SSM receiver filtering on
+  "the other one" then silently receives nothing while both ends work
+  perfectly. `mcast-send G --source S` binds the socket, which removes
+  selection from the picture; pair it with the matching
+  `mcast-receive G --source S` so the same `S` flows through the whole
+  (S,G) demo. (The bind sets the source, not the egress — add
+  `--interface` for fully deterministic egress. The same flag works on
+  IPv4, where it matters once a host carries secondaries or VIPs.)
 - **Scopes and zones.** Interface-local (`ff01::`) and link-local (`ff02::`)
   scope groups never appear usefully in the routing table, so the kernel
   must be told which interface — give a zone (`ff02::42%eth1`) or
