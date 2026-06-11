@@ -13,6 +13,7 @@ dashboard with rate, byte counts, and config.
 from __future__ import annotations
 
 import argparse
+import errno
 import ipaddress
 import os
 import secrets
@@ -48,6 +49,7 @@ from .common import (
     split_scope,
     tos_byte_from_dscp,
     validate_multicast_group,
+    validate_source,
 )
 
 
@@ -144,6 +146,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="DSCP value (0-63 or name: be, ef, af41, cs5, etc). Default: be",
     )
     parser.add_argument(
+        "--source", "-S",
+        help=(
+            "Source address to send FROM (binds the socket). Without this, "
+            "the kernel picks via source-address selection (RFC 6724 on "
+            "IPv6) — which is non-deterministic when an interface carries "
+            "multiple candidate addresses. Pin it for SSM demos. Pair with "
+            "--interface for fully deterministic egress."
+        ),
+    )
+    parser.add_argument(
         "--interface", "-i",
         help="Egress interface name (default: chosen by routing table)",
     )
@@ -222,6 +234,7 @@ def setup_sender_socket(
     dscp: int,
     interface_ip: Optional[str],
     enable_loopback: bool,
+    source: Optional[str] = None,
 ) -> socket.socket:
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
     # TTL
@@ -244,6 +257,10 @@ def setup_sender_socket(
             socket.IP_MULTICAST_IF,
             socket.inet_aton(interface_ip),
         )
+    # Pin the source address. Note this sets the *source*, not the egress —
+    # IP_MULTICAST_IF (or the route table) still decides the interface.
+    if source:
+        sock.bind((source, 0))
     return sock
 
 
@@ -252,6 +269,7 @@ def setup_sender_socket_v6(
     dscp: int,
     ifindex: Optional[int],
     enable_loopback: bool,
+    source: Optional[str] = None,
 ) -> socket.socket:
     """IPv6 sibling of setup_sender_socket. Key differences from v4:
     hop limit instead of TTL, traffic class instead of TOS, and
@@ -269,6 +287,11 @@ def setup_sender_socket_v6(
     # Egress interface override — by index for IPv6
     if ifindex:
         sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_MULTICAST_IF, ifindex)
+    # Pin the source address — takes RFC 6724 selection out of the picture
+    # entirely (the rules only apply to unbound sockets). Sources are
+    # validated zone-free upstream, so scope_id 0 is correct here.
+    if source:
+        sock.bind((source, 0, 0, 0))
     return sock
 
 
@@ -376,12 +399,15 @@ def render_dashboard(
     stats: SenderStats,
     running: bool,
     hop_label: str = "TTL",
+    source: Optional[str] = None,
 ) -> Panel:
     cfg = Table.grid(padding=(0, 2))
     cfg.add_column(style="dim", no_wrap=True)
     cfg.add_column()
 
     cfg.add_row("Group:", f"[bold cyan]{group}[/]  [dim]({group_class})[/]")
+    if source:
+        cfg.add_row("Source:", f"{source}  [dim](bound)[/]")
     iface_str = interface if interface else "[dim]routing default[/]"
     if iface_ip:
         iface_str += f"  [dim]({iface_ip})[/]"
@@ -531,6 +557,14 @@ def main(argv: Optional[list[str]] = None) -> int:
     group_class = classify_multicast_group(group_addr)
     is_v6 = isinstance(group_addr, ipaddress.IPv6Address)
     hop_label = "Hop limit" if is_v6 else "TTL"
+
+    source_ip: Optional[str] = None
+    if args.source:
+        try:
+            source_ip = str(validate_source(args.source, group_addr))
+        except ValueError as e:
+            console.print(f"[red]error:[/] {e}")
+            return 2
     if not is_v6 and group_addr in ipaddress.IPv4Network("224.0.0.0/24"):
         console.print(
             f"[yellow]warning:[/] {group_addr} is in 224.0.0.0/24 (link-local, "
@@ -644,6 +678,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 dscp=dscp,
                 ifindex=ifindex,
                 enable_loopback=not args.no_loopback,
+                source=source_ip,
             )
         else:
             sock = setup_sender_socket(
@@ -652,8 +687,16 @@ def main(argv: Optional[list[str]] = None) -> int:
                 dscp=dscp,
                 interface_ip=iface_ip,
                 enable_loopback=not args.no_loopback,
+                source=source_ip,
             )
     except OSError as e:
+        if source_ip and e.errno == errno.EADDRNOTAVAIL:
+            console.print(
+                f"[red]error:[/] source {source_ip} isn't assigned to this "
+                f"host. Check `ip {'-6 ' if is_v6 else ''}addr` and pick an "
+                "address that exists (ideally on the egress interface)."
+            )
+            return 1
         console.print(f"[red]socket setup failed:[/] {e}")
         return 1
 
@@ -674,7 +717,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.quiet:
         console.print(
             f"mcast-send: {group_host} via {iface_name or 'routing default'} "
-            f"{hop_label}={ttl} DSCP={dscp_label(dscp)} rate={fmt_pps(target_pps)} "
+            + (f"src={source_ip} " if source_ip else "")
+            + f"{hop_label}={ttl} DSCP={dscp_label(dscp)} rate={fmt_pps(target_pps)} "
             f"size={args.size}B duration={duration}s"
         )
 
@@ -715,6 +759,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 sender_id=sender_id,
                 duration=duration,
                 stats=stats,
+                source=source_ip,
                 running=True,
             ),
             console=console,
@@ -736,6 +781,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                         sender_id=sender_id,
                         duration=duration,
                         stats=stats,
+                        source=source_ip,
                         running=True,
                     )
                 )
@@ -755,6 +801,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                     sender_id=sender_id,
                     duration=duration,
                     stats=stats,
+                    source=source_ip,
                     running=False,
                 )
             )
@@ -769,6 +816,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             "version": __version__,
             "group": group_host,
             "family": group_addr.version,
+            "source": source_ip,
             "interface": iface_name,
             "ttl": ttl,
             "dscp": dscp,
