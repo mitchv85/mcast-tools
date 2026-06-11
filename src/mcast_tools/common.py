@@ -13,6 +13,7 @@ import ipaddress
 import json
 import os
 import re
+import socket
 import struct
 import subprocess
 import sys
@@ -276,6 +277,68 @@ def validate_source(
             f"Source '{source}' is a multicast address — sources must be unicast"
         )
     return addr
+
+
+# ---------------------------------------------------------------------------
+# IPv6 multicast join structures
+# ---------------------------------------------------------------------------
+#
+# Python's socket module exposes IPV6_JOIN_GROUP but (on many builds) not the
+# protocol-independent MCAST_* options, and there is no IPv6 equivalent of
+# IP_ADD_SOURCE_MEMBERSHIP — IPv6 SSM joins go through MCAST_JOIN_SOURCE_GROUP
+# with a struct group_source_req. We pack both structures by hand against the
+# Linux UAPI layout (include/uapi/linux/in.h, in6.h); see
+# tests/test_join_structs.py for the byte-precise layout contract.
+
+# Linux include/uapi/linux/in.h
+MCAST_JOIN_SOURCE_GROUP = getattr(socket, "MCAST_JOIN_SOURCE_GROUP", 46)
+
+_SOCKADDR_STORAGE_SIZE = 128
+GROUP_SOURCE_REQ_SIZE = 8 + 2 * _SOCKADDR_STORAGE_SIZE  # 264 on x86_64
+
+
+def pack_ipv6_mreq(group: ipaddress.IPv6Address, ifindex: int) -> bytes:
+    """Pack struct ipv6_mreq for IPV6_JOIN_GROUP (ASM join).
+
+    ifindex 0 lets the kernel pick the interface.
+    """
+    unscoped, _zone = split_scope(group)
+    return struct.pack("=16si", unscoped.packed, ifindex)
+
+
+def _pack_sockaddr_in6_storage(
+    addr: ipaddress.IPv6Address, scope_id: int = 0
+) -> bytes:
+    """Pack a sockaddr_in6 inside a zeroed 128-byte sockaddr_storage."""
+    unscoped, _zone = split_scope(addr)
+    sa = struct.pack(
+        "=H",  # sa_family_t — native byte order
+        socket.AF_INET6,
+    )
+    sa += struct.pack("!HI", 0, 0)  # sin6_port, sin6_flowinfo — zero for joins
+    sa += unscoped.packed  # sin6_addr
+    sa += struct.pack("=I", scope_id)  # sin6_scope_id — native byte order
+    return sa.ljust(_SOCKADDR_STORAGE_SIZE, b"\x00")
+
+
+def pack_group_source_req(
+    ifindex: int,
+    group: ipaddress.IPv6Address,
+    source: ipaddress.IPv6Address,
+    group_scope_id: int = 0,
+) -> bytes:
+    """Pack struct group_source_req for MCAST_JOIN_SOURCE_GROUP (SSM join).
+
+    Layout (x86_64): u32 gsr_interface, 4 pad bytes (storage is 8-aligned),
+    then two 128-byte sockaddr_storage blocks (group, source) = 264 bytes.
+    """
+    buf = struct.pack("=I4x", ifindex)
+    buf += _pack_sockaddr_in6_storage(group, scope_id=group_scope_id)
+    buf += _pack_sockaddr_in6_storage(source)
+    assert len(buf) == GROUP_SOURCE_REQ_SIZE, (
+        f"group_source_req size drift: {len(buf)}"
+    )
+    return buf
 
 
 # ---------------------------------------------------------------------------
