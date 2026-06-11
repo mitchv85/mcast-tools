@@ -128,8 +128,17 @@ def make_packet(
 # Multicast address validation
 # ---------------------------------------------------------------------------
 
-def validate_multicast_group(group: str) -> ipaddress.IPv4Address:
-    """Validate `group` is an IPv4 multicast address. Returns the address object.
+# Either address family. IPv6 addresses may carry a zone id (ff02::1%eth1).
+MulticastAddress = "ipaddress.IPv4Address | ipaddress.IPv6Address"
+
+
+def validate_multicast_group(
+    group: str,
+) -> "ipaddress.IPv4Address | ipaddress.IPv6Address":
+    """Validate `group` is an IPv4 or IPv6 multicast address.
+
+    Returns the address object. IPv6 addresses may include a zone id
+    (``ff02::42%eth1``) — preserved on the returned object's ``scope_id``.
 
     Raises ValueError with a friendly message on failure.
     """
@@ -137,20 +146,88 @@ def validate_multicast_group(group: str) -> ipaddress.IPv4Address:
         addr = ipaddress.ip_address(group)
     except ValueError:
         raise ValueError(f"'{group}' is not a valid IP address")
-    if not isinstance(addr, ipaddress.IPv4Address):
-        raise ValueError(
-            f"'{group}' is IPv6 — mcast-tools v0.1 supports IPv4 only"
-        )
     if not addr.is_multicast:
+        if isinstance(addr, ipaddress.IPv4Address):
+            raise ValueError(
+                f"'{group}' is not a multicast address "
+                f"(IPv4 multicast range is 224.0.0.0/4)"
+            )
         raise ValueError(
             f"'{group}' is not a multicast address "
-            f"(IPv4 multicast range is 224.0.0.0/4)"
+            f"(IPv6 multicast range is ff00::/8)"
         )
     return addr
 
 
-def classify_multicast_group(addr: ipaddress.IPv4Address) -> str:
+def split_scope(
+    addr: ipaddress.IPv6Address,
+) -> "tuple[ipaddress.IPv6Address, Optional[str]]":
+    """Split an IPv6 address into (unscoped address, zone-or-None).
+
+    ``ff02::1%eth1`` → (``ff02::1``, ``"eth1"``). The unscoped form is what
+    classification, range checks, and ``inet_pton`` want; the zone names the
+    interface for socket-level scope resolution.
+    """
+    zone = getattr(addr, "scope_id", None)
+    if zone:
+        # Rebuilding from packed bytes drops the zone cleanly.
+        return ipaddress.IPv6Address(addr.packed), zone
+    return addr, None
+
+
+# RFC 4291 §2.7 — IPv6 multicast scope field (low nibble of byte 1).
+_V6_SCOPE_NAMES = {
+    0x1: "interface-local",
+    0x2: "link-local",
+    0x3: "realm-local",
+    0x4: "admin-local",
+    0x5: "site-local",
+    0x8: "organization-local",
+    0xE: "global",
+}
+
+# Solicited-node multicast (RFC 4291 §2.7.1): ff02::1:ff00:0/104.
+_V6_SOLICITED_NODE = ipaddress.IPv6Network("ff02::1:ff00:0/104")
+
+# RFC 4607 — the IPv6 SSM range is ff3x::/32 for every scope x,
+# i.e. flags nibble == 3 (P=1, T=1), which is exactly ff30::/12.
+_V6_SSM_RANGE = ipaddress.IPv6Network("ff30::/12")
+
+
+def _classify_v6(addr: ipaddress.IPv6Address) -> str:
+    """Classify an IPv6 multicast group by flags nibble + scope (RFC 4291)."""
+    unscoped, _zone = split_scope(addr)
+    b = unscoped.packed
+    flags = (b[1] >> 4) & 0xF
+    scope = b[1] & 0xF
+    scope_str = _V6_SCOPE_NAMES.get(scope, f"scope-{scope:x}")
+    # Interface-local and link-local scopes never cross a router.
+    if scope in (0x1, 0x2):
+        scope_str += " scope (not routed)"
+    else:
+        scope_str += " scope"
+
+    if unscoped in _V6_SOLICITED_NODE:
+        kind = "solicited-node"
+    elif flags == 0x3:
+        kind = "SSM (source-specific)"
+    elif flags & 0x4:
+        kind = "embedded-RP"
+    elif flags & 0x2:
+        kind = "unicast-prefix-based"
+    elif flags & 0x1:
+        kind = "transient"
+    else:
+        kind = "well-known"
+    return f"{kind}, {scope_str}"
+
+
+def classify_multicast_group(
+    addr: "ipaddress.IPv4Address | ipaddress.IPv6Address",
+) -> str:
     """Return a short human-readable scope/classification for an mcast group."""
+    if isinstance(addr, ipaddress.IPv6Address):
+        return _classify_v6(addr)
     if addr in ipaddress.IPv4Network("224.0.0.0/24"):
         return "link-local (not routed)"
     if addr in ipaddress.IPv4Network("232.0.0.0/8"):
@@ -162,17 +239,38 @@ def classify_multicast_group(addr: ipaddress.IPv4Address) -> str:
     return "any-source multicast"
 
 
-def is_ssm_group(addr: ipaddress.IPv4Address) -> bool:
+def is_ssm_group(
+    addr: "ipaddress.IPv4Address | ipaddress.IPv6Address",
+) -> bool:
+    if isinstance(addr, ipaddress.IPv6Address):
+        unscoped, _zone = split_scope(addr)
+        return unscoped in _V6_SSM_RANGE
     return addr in ipaddress.IPv4Network("232.0.0.0/8")
 
 
-def validate_source(source: str) -> ipaddress.IPv4Address:
+def validate_source(
+    source: str,
+    group: "ipaddress.IPv4Address | ipaddress.IPv6Address",
+) -> "ipaddress.IPv4Address | ipaddress.IPv6Address":
+    """Validate an SSM source address against the group's address family.
+
+    The source must be unicast, zone-free, and in the same family as the
+    group — an (S,G) pair can't straddle IPv4 and IPv6.
+    """
     try:
         addr = ipaddress.ip_address(source)
     except ValueError:
         raise ValueError(f"'{source}' is not a valid IP address")
-    if not isinstance(addr, ipaddress.IPv4Address):
-        raise ValueError("Source must be an IPv4 address")
+    if isinstance(addr, ipaddress.IPv6Address) and getattr(addr, "scope_id", None):
+        raise ValueError(
+            f"Source '{source}' carries a %zone — sources should be plain "
+            "addresses. Pick the interface via the group's zone or --interface."
+        )
+    if addr.version != group.version:
+        raise ValueError(
+            f"Source '{source}' is IPv{addr.version} but the group is "
+            f"IPv{group.version} — an (S,G) pair must share one address family"
+        )
     if addr.is_multicast:
         raise ValueError(
             f"Source '{source}' is a multicast address — sources must be unicast"
