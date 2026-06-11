@@ -5,6 +5,65 @@ All notable changes to mcast-tools are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] — 2026-06-11
+
+IPv6 / MLD support across all three tools — paying off the limitation
+listed in v0.1.0. The address family is auto-detected from the group
+address; there is no `--ipv6` flag, and the IPv4 paths are byte-for-byte
+unchanged (locked by regression tests and a live loopback pair).
+
+### Added
+
+- **IPv6 groups everywhere.** `mcast-send` and `mcast-receive` accept
+  IPv6 multicast groups (`ff00::/8`), including zone-id syntax for
+  link-local scopes (`ff02::42%eth1`). Sources for SSM must match the
+  group's family.
+- **IPv6 classification.** Dashboards and `mcast-status` classify v6
+  groups by RFC 4291 flags + scope (well-known / transient /
+  unicast-prefix-based / embedded-RP / SSM / solicited-node, with scope
+  names and a "(not routed)" hint for interface-/link-local).
+- **MLD support in `mcast-receive`.** New `--mld-version {1,2}` flag
+  (MLDv1 ≈ IGMPv2, MLDv2 ≈ IGMPv3); the positional version slot is
+  interpreted per family. SSM on IPv6 requires MLDv2, mirroring the
+  IGMPv3 rule with the same explanation. MLD version forcing
+  saves/restores `/proc/sys/net/ipv6/conf/<iface>/force_mld_version`
+  exactly like the IGMP flow. Cross-family flags (`--igmp-version` on a
+  v6 group and vice versa) produce educational errors.
+- **IPv6 joins.** ASM via `IPV6_JOIN_GROUP` + `struct ipv6_mreq`; SSM via
+  `MCAST_JOIN_SOURCE_GROUP` + a hand-packed 264-byte
+  `struct group_source_req` (Python doesn't expose this option; layout is
+  byte-verified against the Linux UAPI headers in the test suite).
+- **Per-packet hop limit / traffic class** on the receiver via
+  `IPV6_RECVHOPLIMIT` / `IPV6_RECVTCLASS` ancillary data — hop-count and
+  DSCP-remark detection work identically across families.
+- **`mcast-send` IPv6 plumbing:** `IPV6_MULTICAST_HOPS` / `_LOOP` /
+  `_TCLASS` / `_IF` (by interface index), egress resolution via zone /
+  `--interface` / route table, and a hard requirement (with guidance) for
+  an interface on interface-/link-local scope groups. `--hop-limit` added
+  as an alias of `--ttl`.
+- **`mcast-status` IPv6 table** from `/proc/net/igmp6` with a Forced-MLD
+  column. All-nodes and solicited-node groups are hidden by default
+  (they're NDP plumbing, not joins); `--all` reveals them.
+- **JSON summaries** gain a `"family"` field (4|6); the receiver emits
+  `mld_version_requested` for v6 and keeps `igmp_version_requested` for
+  v4. The `"ttl"` key is retained for both families (it carries the hop
+  limit under IPv6).
+
+### Unchanged on purpose
+
+- **Wire format.** The 32-byte header and `PROTOCOL_VERSION = 1` are
+  untouched; `orig_ttl` carries the IPv6 hop limit. v0.1.0 and v0.2.0
+  tools interoperate on IPv4.
+- **The operational MLD version is not displayed** anywhere —
+  `/proc/net/igmp6` has no version column (unlike `/proc/net/igmp`'s
+  `V3`), so the dashboard and status table honestly show only the
+  requested/forced state.
+
+### Limitations (still deliberately out of scope)
+
+- PCAP integration on the receiver side.
+- Bidirectional / round-trip-time mode.
+
 ## [0.1.0] — 2026-05-22
 
 Initial release. Three CLIs replacing the lab's previous `iperf` usage with
