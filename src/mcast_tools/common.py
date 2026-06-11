@@ -513,6 +513,116 @@ def get_interface_igmp_version(interface: str) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
+# MLD version control (IPv6's IGMP analog)
+# ---------------------------------------------------------------------------
+#
+# MLDv1 ≈ IGMPv2 (ASM only); MLDv2 ≈ IGMPv3 (adds SSM source filtering).
+# There is no MLD analog of IGMPv1. force_mld_version: 0 = auto (kernel
+# default is MLDv2, subject to v1-querier compatibility fallback on the
+# link), 1 = MLDv1, 2 = MLDv2.
+
+def mld_force_path(interface: str) -> Path:
+    return Path(f"/proc/sys/net/ipv6/conf/{interface}/force_mld_version")
+
+
+def read_force_mld_version(interface: str) -> Optional[int]:
+    """Read current force_mld_version sysctl. Returns None if path missing
+    (including hosts where IPv6 is disabled at the kernel level)."""
+    p = mld_force_path(interface)
+    try:
+        return int(p.read_text().strip())
+    except (FileNotFoundError, ValueError, PermissionError):
+        return None
+
+
+def write_force_mld_version(interface: str, version: int) -> bool:
+    """Force MLD version on an interface. Requires root. Returns True on success.
+
+    version=0 means "auto" (kernel default — MLDv2).
+    """
+    if version not in (0, 1, 2):
+        raise ValueError(f"Invalid MLD version: {version}")
+    p = mld_force_path(interface)
+    try:
+        p.write_text(f"{version}\n")
+        return True
+    except (FileNotFoundError, PermissionError):
+        return False
+
+
+# ---------------------------------------------------------------------------
+# /proc/net/igmp6 parsing (IPv6 multicast memberships)
+# ---------------------------------------------------------------------------
+
+_IGMP6_PROC_PATH = Path("/proc/net/igmp6")
+
+
+def _parse_igmp6_text(raw: str) -> dict[str, dict]:
+    """Parse /proc/net/igmp6 content into a dict keyed by interface name.
+
+    Unlike /proc/net/igmp, the IPv6 file is flat — no header line, no
+    per-interface section rows, and (mercifully) addresses are plain
+    network-order hex with no byte-swapping. Kernel format per line
+    (net/ipv6/mcast.c)::
+
+        ifindex ifname <32-hex-group> users flags timer
+
+    e.g. ``33   eth1   ff020000000000000000000000000001   1 0000000C 0``
+
+    There is also no MLD version column — the operational MLD version is
+    not exposed here, only the force_mld_version sysctl reflects forcing.
+
+    Returns::
+
+        {
+            "eth1": {
+                "ifindex": 33,
+                "groups": [
+                    {"address": "ff02::1", "users": 1, "flags": "0000000C"},
+                    ...
+                ]
+            },
+            ...
+        }
+    """
+    interfaces: dict[str, dict] = {}
+    for line in raw.splitlines():
+        parts = re.split(r"\s+", line.strip())
+        if len(parts) < 5:
+            continue
+        ifindex_s, ifname, hex_addr, users_s, flags = parts[:5]
+        if len(hex_addr) != 32:
+            continue
+        try:
+            ifindex = int(ifindex_s)
+            users = int(users_s)
+            addr = ipaddress.IPv6Address(bytes.fromhex(hex_addr))
+        except ValueError:
+            continue
+        entry = interfaces.setdefault(
+            ifname, {"ifindex": ifindex, "groups": []}
+        )
+        entry["groups"].append(
+            {
+                "address": str(addr),
+                "users": users,
+                "flags": flags,
+            }
+        )
+    return interfaces
+
+
+def parse_proc_net_igmp6() -> dict[str, dict]:
+    """Read and parse /proc/net/igmp6. Returns {} if unavailable (e.g. on
+    hosts with IPv6 disabled at the kernel level)."""
+    try:
+        raw = _IGMP6_PROC_PATH.read_text()
+    except (FileNotFoundError, PermissionError):
+        return {}
+    return _parse_igmp6_text(raw)
+
+
+# ---------------------------------------------------------------------------
 # Rate parsing
 # ---------------------------------------------------------------------------
 
