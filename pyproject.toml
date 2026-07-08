@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mcast-tools"
-version = "0.2.1"
+version = "0.2.2"
 description = "Friendly multicast send/receive tools for lab environments"
 readme = "README.md"
 license = { text = "MIT" }
