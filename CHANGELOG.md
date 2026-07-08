@@ -5,6 +5,20 @@ All notable changes to mcast-tools are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.2] — 2026-06-11
+
+### Fixed
+
+- **Crash: `RuntimeError: deque mutated during iteration`** in
+  `current_pps()` on both sender and receiver (present since v0.1.0).
+  The worker thread's rate-sample appends raced the dashboard thread's
+  sliding-window walk; any deque mutation invalidates live iterators.
+  Rate samples are now guarded by a per-stats lock with snapshot-based
+  reads. The bug required a process older than the 5-second rate window
+  and was *most* likely at low packet rates (a stale-majority sample
+  deque maximizes the walk length) — which is why simple default-rate
+  runs hit it while stress runs often didn't.
+
 ## [0.2.1] — 2026-06-11
 
 ### Added
