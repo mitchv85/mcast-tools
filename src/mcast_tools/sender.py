@@ -193,6 +193,11 @@ class SenderStats:
     bytes_sent: int = 0
     # Sliding window of (monotonic_ts, packet_count_at_ts) for current-rate calc
     rate_samples: deque = field(default_factory=lambda: deque(maxlen=2048))
+    # Guards rate_samples: the worker thread appends while the dashboard
+    # thread reads — ANY deque mutation invalidates live iterators.
+    _rate_lock: threading.Lock = field(
+        default_factory=threading.Lock, repr=False, compare=False
+    )
     last_send_ts: float = 0.0
     errors: int = 0
 
@@ -201,23 +206,33 @@ class SenderStats:
             return 0.0
         return time.monotonic() - self.started_at
 
+    def record_rate_sample(self, ts: float, count: int) -> None:
+        """Worker-thread side: append a (ts, count) sample under the lock."""
+        with self._rate_lock:
+            self.rate_samples.append((ts, count))
+
     def current_pps(self) -> float:
-        """Compute pps over the trailing sliding window."""
-        if len(self.rate_samples) < 2:
+        """Compute pps over the trailing sliding window.
+
+        Snapshot-then-compute: the lock is held only for the copy, and the
+        walk happens on an immutable tuple the worker can't touch.
+        """
+        with self._rate_lock:
+            samples = tuple(self.rate_samples)
+        if len(samples) < 2:
             return 0.0
         now = time.monotonic()
         cutoff = now - SLIDING_WINDOW
-        # rate_samples is (ts, count). Walk from the left until ts >= cutoff.
-        # deque doesn't support efficient slicing, so iterate.
+        # samples is (ts, count). Walk from the left until ts >= cutoff.
         oldest_ts = oldest_count = None
-        for ts, count in self.rate_samples:
+        for ts, count in samples:
             if ts >= cutoff:
                 oldest_ts = ts
                 oldest_count = count
                 break
         if oldest_ts is None:
             return 0.0
-        newest_ts, newest_count = self.rate_samples[-1]
+        newest_ts, newest_count = samples[-1]
         dt = newest_ts - oldest_ts
         if dt <= 0:
             return 0.0
@@ -517,7 +532,7 @@ def send_loop(
             stats.packets_sent += 1
             stats.bytes_sent += datagram_size
             stats.last_send_ts = time.monotonic()
-            stats.rate_samples.append((stats.last_send_ts, stats.packets_sent))
+            stats.record_rate_sample(stats.last_send_ts, stats.packets_sent)
             seq += 1
 
         next_send += interval
