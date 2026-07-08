@@ -152,6 +152,11 @@ class ReceiverStats:
     current_gap: Optional[GapEvent] = None
 
     rate_samples: deque = field(default_factory=lambda: deque(maxlen=2048))
+    # Guards rate_samples: the worker thread appends while the dashboard
+    # thread reads — ANY deque mutation invalidates live iterators.
+    _rate_lock: threading.Lock = field(
+        default_factory=threading.Lock, repr=False, compare=False
+    )
 
     def elapsed(self) -> float:
         if self.started_at == 0:
@@ -163,20 +168,29 @@ class ReceiverStats:
             return None
         return time.monotonic() - self.last_recv_ts
 
+    def record_rate_sample(self, ts: float, count: int) -> None:
+        """Worker-thread side: append a (ts, count) sample under the lock."""
+        with self._rate_lock:
+            self.rate_samples.append((ts, count))
+
     def current_pps(self) -> float:
-        if len(self.rate_samples) < 2:
+        # Snapshot-then-compute: the lock is held only for the copy, and
+        # the walk happens on an immutable tuple recv_loop can't touch.
+        with self._rate_lock:
+            samples = tuple(self.rate_samples)
+        if len(samples) < 2:
             return 0.0
         now = time.monotonic()
         cutoff = now - SLIDING_WINDOW
         oldest_ts = oldest_count = None
-        for ts, count in self.rate_samples:
+        for ts, count in samples:
             if ts >= cutoff:
                 oldest_ts = ts
                 oldest_count = count
                 break
         if oldest_ts is None:
             return 0.0
-        newest_ts, newest_count = self.rate_samples[-1]
+        newest_ts, newest_count = samples[-1]
         dt = newest_ts - oldest_ts
         if dt <= 0:
             return 0.0
@@ -509,7 +523,7 @@ def process_packet(
     stats.last_src_addr = src_ip
     if recv_tos is not None:
         stats.last_recv_dscp = dscp_from_tos_byte(recv_tos)
-    stats.rate_samples.append((now, stats.packets_recv))
+    stats.record_rate_sample(now, stats.packets_recv)
 
 
 def check_stall(stats: ReceiverStats, stall_timeout: float) -> None:
