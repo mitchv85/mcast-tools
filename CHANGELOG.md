@@ -5,6 +5,46 @@ All notable changes to mcast-tools are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.3] — 2026-11-18
+
+### Added
+
+- **Windows support.** `mcast-receive` now runs natively on Windows
+  alongside `mcast-send`: IPv4 and IPv6, ASM and SSM, verified on
+  Windows 11 receiving from Linux senders. It used to fail at once with
+  `[WinError 10049] The requested address is not valid in its context`,
+  because it bound its socket to the group address, a Linux idiom that
+  Winsock refuses. On Windows the receiver now binds the wildcard
+  address, skips the Linux-only socket options, reads packets with
+  `recvfrom` (Python has no `recvmsg` there), and packs SSM joins with
+  Winsock's struct layout and option numbers. IPv6 zones and
+  `--interface` take the interface index (`ff02::42%12`). See the
+  Windows section of the [guide](docs/guide.md).
+
+### Fixed
+
+- **IPv4 SSM crashed on Python 3.10 and 3.11** with an `AttributeError`,
+  because `socket.IP_ADD_SOURCE_MEMBERSHIP` only exists from Python 3.12.
+  The platform's value is now used when Python doesn't provide it.
+- **A crash in the receive thread was reported as success**: exit code 0
+  and an all-zero JSON summary. It now prints the error and exits 1, and
+  the JSON summary gains an `"error"` field.
+
+### Changed
+
+- **The README is now a short overview.** The full reference moved to
+  [`docs/guide.md`](docs/guide.md), which adds a Windows section.
+- **PyPI metadata** now lists Windows and Python 3.13.
+
+### Known limitations on Windows
+
+- No received TTL/DSCP readout (shown as `n/a on this platform`), no
+  IGMP/MLD version forcing (a host-wide setting on Windows), no interface
+  selection by name (IPv4 always uses the default interface; only the
+  receiver takes an IPv6 interface index), and no sending to link-local
+  IPv6 groups. `mcast-status` remains Linux-only. `mcast-send` on Windows
+  has been verified over IPv4 only.
+
 ## [0.2.2] — 2026-06-11
 
 ### Fixed

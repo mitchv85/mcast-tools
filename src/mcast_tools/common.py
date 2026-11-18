@@ -306,8 +306,20 @@ def validate_source(
 # Linux UAPI layout (include/uapi/linux/in.h, in6.h); see
 # tests/test_join_structs.py for the byte-precise layout contract.
 
-# Linux include/uapi/linux/in.h
-MCAST_JOIN_SOURCE_GROUP = getattr(socket, "MCAST_JOIN_SOURCE_GROUP", 46)
+def _mcast_join_source_group(platform: str = sys.platform) -> int:
+    """MCAST_JOIN_SOURCE_GROUP for a platform.
+
+    No CPython version exports it. Linux include/uapi/linux/in.h has 46; on
+    Windows (ws2ipdef.h) 46 is MCAST_LEAVE_SOURCE_GROUP and the join is 45.
+    The struct layouts below match Windows x64 too; only this number differs.
+    """
+    value = getattr(socket, "MCAST_JOIN_SOURCE_GROUP", None)
+    if value is not None:
+        return value
+    return 45 if platform == "win32" else 46
+
+
+MCAST_JOIN_SOURCE_GROUP = _mcast_join_source_group()
 
 _SOCKADDR_STORAGE_SIZE = 128
 GROUP_SOURCE_REQ_SIZE = 8 + 2 * _SOCKADDR_STORAGE_SIZE  # 264 on x86_64
@@ -369,6 +381,10 @@ class RouteInfo:
     @classmethod
     def for_destination(cls, dest: str) -> Optional["RouteInfo"]:
         """Run `ip -j route get <dest>` and parse the result. Returns None on failure."""
+        if sys.platform == "win32":
+            # No `ip` on Windows, and CreateProcess would search the current
+            # directory for one before PATH.
+            return None
         try:
             result = subprocess.run(
                 ["ip", "-j", "route", "get", dest],

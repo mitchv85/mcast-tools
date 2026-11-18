@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mcast-tools"
-version = "0.2.2"
-description = "Friendly multicast send/receive tools for lab environments"
+version = "0.2.3"
+description = "Friendly multicast send/receive tools for Linux and Windows labs: IPv4 and IPv6, ASM and SSM, live dashboards"
 readme = "README.md"
 license = { text = "MIT" }
 authors = [
@@ -20,11 +20,13 @@ classifiers = [
     "Environment :: Console",
     "Intended Audience :: System Administrators",
     "License :: OSI Approved :: MIT License",
+    "Operating System :: Microsoft :: Windows",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: System :: Networking",
 ]
 

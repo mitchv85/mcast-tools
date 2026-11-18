@@ -312,6 +312,10 @@ def setup_sender_socket_v6(
 
 def get_interface_ip(interface: str) -> Optional[str]:
     """Look up the primary IPv4 address of an interface using `ip -j addr show`."""
+    if sys.platform == "win32":
+        # No `ip` on Windows, and CreateProcess would search the current
+        # directory for one before PATH.
+        return None
     import json
     import subprocess
     try:
@@ -358,6 +362,8 @@ def _pick_v6_addr(addr_info: list) -> Optional[str]:
 def get_interface_ipv6(interface: str) -> Optional[str]:
     """Look up an IPv6 address of an interface (global preferred, link
     fallback) using `ip -j -6 addr show`."""
+    if sys.platform == "win32":
+        return None  # see get_interface_ip
     import json
     import subprocess
     try:

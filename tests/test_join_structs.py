@@ -27,6 +27,7 @@ ABI, not style. Offsets below come from the Linux UAPI headers
 import ipaddress
 import socket
 import struct
+import sys
 
 import pytest
 
@@ -123,7 +124,7 @@ def test_gsr_storage_tails_are_zero():
 
 
 def test_mcast_join_source_group_constant():
-    # Linux include/uapi/linux/in.h: MCAST_JOIN_SOURCE_GROUP = 46.
-    # Python's socket module doesn't expose it on all builds; ours must
-    # resolve to the kernel value either way.
-    assert MCAST_JOIN_SOURCE_GROUP == 46
+    # Linux include/uapi/linux/in.h: MCAST_JOIN_SOURCE_GROUP = 46. Windows
+    # ws2ipdef.h: 45 (46 is MCAST_LEAVE_SOURCE_GROUP there). Python's socket
+    # module doesn't expose it; ours must resolve to the platform value.
+    assert MCAST_JOIN_SOURCE_GROUP == (45 if sys.platform == "win32" else 46)

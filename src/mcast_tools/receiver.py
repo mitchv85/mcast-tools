@@ -67,6 +67,19 @@ from .common import (
 
 
 # ---------------------------------------------------------------------------
+# Platform differences
+# ---------------------------------------------------------------------------
+#
+# The receiver was written against Linux. Windows differs in three ways that
+# matter here: Winsock won't bind a socket to a multicast address (it fails
+# with WSAEADDRNOTAVAIL, WinError 10049), it has no IP_MULTICAST_ALL, and
+# Python on Windows has no socket.recvmsg, so the per-packet TTL/TOS that
+# arrive as ancillary data can't be read there.
+IS_WINDOWS = sys.platform == "win32"
+HAVE_RECVMSG = hasattr(socket.socket, "recvmsg") and hasattr(socket, "CMSG_SPACE")
+
+
+# ---------------------------------------------------------------------------
 # Linux socket constants not exposed by Python's socket module on every version
 # ---------------------------------------------------------------------------
 
@@ -307,6 +320,42 @@ def build_parser() -> argparse.ArgumentParser:
 # Socket setup and multicast joins
 # ---------------------------------------------------------------------------
 
+def ip_add_source_membership_option() -> Optional[int]:
+    """IP_ADD_SOURCE_MEMBERSHIP for this platform, or None if unknown.
+
+    Python's socket module only exports it from 3.12 on, so 3.10/3.11 need
+    the platform value: 15 on Windows (ws2ipdef.h), 39 on Linux
+    (include/uapi/linux/in.h).
+    """
+    opt = getattr(socket, "IP_ADD_SOURCE_MEMBERSHIP", None)
+    if opt is None:
+        if IS_WINDOWS:
+            opt = 15
+        elif sys.platform.startswith("linux"):
+            opt = 39
+    return opt
+
+
+def resolve_ifindex(name: str) -> int:
+    """Interface name -> index; raises OSError if there's no such interface.
+
+    On Windows, if_nametoindex only knows NDIS names such as
+    'ethernet_32770', while Windows itself shows IPv6 zones as numbers
+    (fe80::1%12 in ipconfig). So there a numeric name is taken as the index,
+    after checking that an interface with that index exists.
+    """
+    if IS_WINDOWS and name.isascii() and name.isdigit():
+        # Interface indexes are 32-bit. Bound the text before int() (Python
+        # caps int() at 4300 digits), and keep 0xFFFFFFFF away from
+        # if_indextoname: CPython 3.10 raises SystemError for it on Windows.
+        if len(name) > 10 or not 0 < int(name) < 0xFFFFFFFF:
+            raise OSError(f"no interface with index {name}")
+        index = int(name)
+        socket.if_indextoname(index)  # OSError if there's no such interface
+        return index
+    return socket.if_nametoindex(name)
+
+
 def setup_receiver_socket(
     group: str,
     source: Optional[str],
@@ -319,40 +368,53 @@ def setup_receiver_socket(
     except (AttributeError, OSError):
         pass
 
-    # Don't deliver multicast traffic for groups we haven't explicitly joined
-    try:
-        sock.setsockopt(socket.IPPROTO_IP, IP_MULTICAST_ALL, 0)
-    except OSError:
-        pass
+    # Linux-only options, skipped on Windows: it has no IP_MULTICAST_ALL, the
+    # TTL/TOS ancillary data can't be read without recvmsg, and these fallback
+    # numbers select other options there (12 is IP_ADD_MEMBERSHIP). Winsock
+    # may also defer checking options set before bind() and fail the bind.
+    if not IS_WINDOWS:
+        # Don't deliver multicast traffic for groups we haven't explicitly joined
+        try:
+            sock.setsockopt(socket.IPPROTO_IP, IP_MULTICAST_ALL, 0)
+        except OSError:
+            pass
 
-    # Enable per-packet TTL and TOS in ancillary data
-    try:
-        sock.setsockopt(socket.IPPROTO_IP, IP_RECVTTL, 1)
-    except OSError:
-        pass
-    try:
-        sock.setsockopt(socket.IPPROTO_IP, IP_RECVTOS, 1)
-    except OSError:
-        pass
+        # Enable per-packet TTL and TOS in ancillary data
+        try:
+            sock.setsockopt(socket.IPPROTO_IP, IP_RECVTTL, 1)
+        except OSError:
+            pass
+        try:
+            sock.setsockopt(socket.IPPROTO_IP, IP_RECVTOS, 1)
+        except OSError:
+            pass
 
     # Bind to the multicast address + port. Binding to the group address rather
     # than INADDR_ANY makes the kernel filter by destination IP for us, so we
-    # only receive traffic destined to this exact group.
-    sock.bind((group, MCAST_PORT))
+    # only receive traffic destined to this exact group. Windows refuses to bind
+    # a multicast address (WinError 10049), so there we bind the wildcard and
+    # let the join decide what arrives.
+    sock.bind(("0.0.0.0" if IS_WINDOWS else group, MCAST_PORT))
 
     # Determine the interface address to use for the join.
     iface_addr = interface_ip if interface_ip else "0.0.0.0"
 
     if source:
-        # SSM: source-specific join — IP_ADD_SOURCE_MEMBERSHIP
-        # struct ip_mreq_source { in_addr multi; in_addr iface; in_addr source; }
-        mreq = struct.pack(
-            "=4s4s4s",
-            socket.inet_aton(group),
-            socket.inet_aton(iface_addr),
-            socket.inet_aton(source),
+        # SSM: source-specific join — IP_ADD_SOURCE_MEMBERSHIP. The field order
+        # of struct ip_mreq_source differs by platform:
+        #   Linux:   { in_addr multi; in_addr iface;  in_addr source; }
+        #   Windows: { in_addr multi; in_addr source; in_addr iface;  }
+        opt = ip_add_source_membership_option()
+        if opt is None:
+            raise OSError(
+                "this Python doesn't expose IP_ADD_SOURCE_MEMBERSHIP, which "
+                "SSM joins need (added in Python 3.12)"
+            )
+        fields = (
+            (group, source, iface_addr) if IS_WINDOWS else (group, iface_addr, source)
         )
-        sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_SOURCE_MEMBERSHIP, mreq)
+        mreq = struct.pack("=4s4s4s", *(socket.inet_aton(a) for a in fields))
+        sock.setsockopt(socket.IPPROTO_IP, opt, mreq)
     else:
         # ASM: any-source join — IP_ADD_MEMBERSHIP
         mreq = struct.pack(
@@ -389,26 +451,34 @@ def setup_receiver_socket_v6(
     except (AttributeError, OSError):
         pass
 
-    # Don't deliver multicast traffic for groups we haven't explicitly
-    # joined (kernel 4.20+; best-effort on older kernels)
-    try:
-        sock.setsockopt(socket.IPPROTO_IPV6, IPV6_MULTICAST_ALL, 0)
-    except OSError:
-        pass
+    # Linux-only options, skipped on Windows for the same reasons as in
+    # setup_receiver_socket (there 29 is IPV6_ADD_IFLIST, 51 IPV6_PKTINFO_EX).
+    if not IS_WINDOWS:
+        # Don't deliver multicast traffic for groups we haven't explicitly
+        # joined (kernel 4.20+; best-effort on older kernels)
+        try:
+            sock.setsockopt(socket.IPPROTO_IPV6, IPV6_MULTICAST_ALL, 0)
+        except OSError:
+            pass
 
-    # Enable per-packet hop limit and traffic class in ancillary data
-    try:
-        sock.setsockopt(socket.IPPROTO_IPV6, IPV6_RECVHOPLIMIT, 1)
-    except OSError:
-        pass
-    try:
-        sock.setsockopt(socket.IPPROTO_IPV6, IPV6_RECVTCLASS, 1)
-    except OSError:
-        pass
+        # Enable per-packet hop limit and traffic class in ancillary data
+        try:
+            sock.setsockopt(socket.IPPROTO_IPV6, IPV6_RECVHOPLIMIT, 1)
+        except OSError:
+            pass
+        try:
+            sock.setsockopt(socket.IPPROTO_IPV6, IPV6_RECVTCLASS, 1)
+        except OSError:
+            pass
 
     # Bind to the group address + port — same dest-filtering trick as v4.
-    # The 4-tuple's scope_id matters for link-local groups.
-    sock.bind((str(unscoped), MCAST_PORT, 0, idx))
+    # The 4-tuple's scope_id matters for link-local groups. Windows can't bind
+    # a multicast address, so there we bind the wildcard; the join's interface
+    # index (ipv6mr_interface / gsr_interface) still picks the link.
+    if IS_WINDOWS:
+        sock.bind(("::", MCAST_PORT, 0, 0))
+    else:
+        sock.bind((str(unscoped), MCAST_PORT, 0, idx))
 
     if source:
         # SSM: (S,G) join via MCAST_JOIN_SOURCE_GROUP + group_source_req
@@ -583,9 +653,14 @@ def recv_loop(
         if time.monotonic() >= deadline:
             break
         try:
-            data, ancdata, _flags, src_addr = sock.recvmsg(
-                RECV_BUF_BYTES, socket.CMSG_SPACE(64)
-            )
+            if HAVE_RECVMSG:
+                data, ancdata, _flags, src_addr = sock.recvmsg(
+                    RECV_BUF_BYTES, socket.CMSG_SPACE(64)
+                )
+            else:
+                # Windows: Python has no recvmsg there, so no TTL/TOS cmsgs
+                data, src_addr = sock.recvfrom(RECV_BUF_BYTES)
+                ancdata = []
         except socket.timeout:
             check_stall(stats, stall_timeout)
             continue
@@ -634,7 +709,9 @@ def render_dashboard(
     cfg.add_row("Interface:", iface_str)
 
     # IGMP version row — show requested vs observed
-    if observed_igmp:
+    if IS_WINDOWS:
+        igmp_str = "[dim]OS setting (not forced on Windows)[/]"
+    elif observed_igmp:
         obs_int = int(observed_igmp.lstrip("V")) if observed_igmp.startswith("V") else None
         if obs_int == requested_igmp:
             igmp_str = f"v{requested_igmp} (forced)  [green]✓ confirmed[/]"
@@ -700,6 +777,11 @@ def render_dashboard(
         live.add_row("Received TTL:", ttl_str)
     elif stats.last_recv_ttl is not None:
         live.add_row("Received TTL:", str(stats.last_recv_ttl))
+    elif not HAVE_RECVMSG and stats.last_orig_ttl is not None:
+        live.add_row(
+            "Received TTL:",
+            f"[dim]n/a on this platform (sender set {stats.last_orig_ttl})[/]",
+        )
 
     # DSCP / remarking
     if stats.last_recv_dscp is not None and stats.last_orig_dscp is not None:
@@ -716,6 +798,12 @@ def render_dashboard(
         live.add_row("Received DSCP:", dscp_str)
     elif stats.last_recv_dscp is not None:
         live.add_row("Received DSCP:", dscp_label(stats.last_recv_dscp))
+    elif not HAVE_RECVMSG and stats.last_orig_dscp is not None:
+        live.add_row(
+            "Received DSCP:",
+            "[dim]n/a on this platform "
+            f"(sender set {dscp_label(stats.last_orig_dscp)})[/]",
+        )
 
     # ----- quality section -----
     qual = Table.grid(padding=(0, 2))
@@ -916,15 +1004,22 @@ def main(argv: Optional[list[str]] = None) -> int:
         iface_name = iface_name or zone
         if iface_name:
             try:
-                ifindex = socket.if_nametoindex(iface_name)
+                ifindex = resolve_ifindex(iface_name)
             except OSError:
+                hint = (
+                    " — on Windows, use the interface index: the %number "
+                    "ipconfig shows after its fe80:: address"
+                    if IS_WINDOWS
+                    else ""
+                )
                 console.print(
-                    f"[red]error:[/] interface '{iface_name}' not found"
+                    f"[red]error:[/] interface '{iface_name}' not found{hint}"
                 )
                 return 2
             from .sender import get_interface_ipv6
             iface_ip = get_interface_ipv6(iface_name)
-            if iface_ip is None:
+            # Display only, and there's no lookup for it on Windows
+            if iface_ip is None and not IS_WINDOWS:
                 console.print(
                     f"[yellow]warning:[/] could not resolve an IPv6 address "
                     f"for {iface_name}"
@@ -939,17 +1034,29 @@ def main(argv: Optional[list[str]] = None) -> int:
                 except OSError:
                     ifindex = None
         if needs_explicit_interface(group_addr) and not ifindex:
+            zone_hint = (
+                f"({group_host}%12, the interface index ipconfig shows)"
+                if IS_WINDOWS
+                else f"({group_host}%eth1)"
+            )
             console.print(
                 f"[red]error:[/] {group_host} is interface-/link-local scope — "
                 "the kernel needs an interface to join on. Use a %zone "
-                f"({group_host}%eth1) or --interface."
+                f"{zone_hint} or --interface."
             )
             return 2
     else:
         if iface_name:
             from .sender import get_interface_ip
             iface_ip = get_interface_ip(iface_name)
-            if iface_ip is None:
+            if iface_ip is None and IS_WINDOWS:
+                console.print(
+                    "[yellow]warning:[/] mcast-receive can't look up interface "
+                    f"names on Windows yet — ignoring --interface {iface_name} "
+                    "and joining on the OS default interface"
+                )
+                iface_name = None  # so the dashboard and JSON tell the truth
+            elif iface_ip is None:
                 console.print(
                     f"[yellow]warning:[/] could not resolve IPv4 address for {iface_name}"
                 )
@@ -964,7 +1071,25 @@ def main(argv: Optional[list[str]] = None) -> int:
     write_force = write_force_mld_version if is_v6 else write_force_igmp_version
     saved_force: Optional[int] = None
     version_forced = False
-    if iface_name:
+    if IS_WINDOWS:
+        # Forcing goes through Linux's per-interface /proc sysctls. Windows
+        # only has a host-wide, persistent setting, which isn't ours to change.
+        version_requested = any(
+            v is not None
+            for v in (args.igmp_version_flag, args.mld_version_flag, args.igmp_version)
+        )
+        if version_requested:
+            cmdlet = (
+                "Set-NetIPv6Protocol -MldVersion"
+                if is_v6
+                else "Set-NetIPv4Protocol -IGMPVersion"
+            )
+            console.print(
+                f"[yellow]warning:[/] mcast-receive can't force the {proto_label} "
+                f"version on Windows, where it's a host-wide setting ({cmdlet}, "
+                "from an elevated PowerShell). Continuing with the OS setting."
+            )
+    elif iface_name:
         saved_force = read_force(iface_name)
         if saved_force is None:
             console.print(
@@ -1032,11 +1157,26 @@ def main(argv: Optional[list[str]] = None) -> int:
         console.print(
             f"mcast-receive: joining {group_host}"
             + (f" source {source_ip}" if source_ip else "")
-            + f" on {iface_name or 'routing default'} as {proto_label}v{version}"
+            + f" on {iface_name or 'routing default'}"
+            + (
+                f" ({proto_label} version: OS setting)"
+                if IS_WINDOWS
+                else f" as {proto_label}v{version}"
+            )
         )
 
+    # Remember a crash in the receive thread so it isn't reported as success
+    rx_errors: list[BaseException] = []
+
+    def run_recv_loop(**kwargs) -> None:
+        try:
+            recv_loop(**kwargs)
+        except BaseException as e:
+            rx_errors.append(e)
+            raise
+
     recv_thread = threading.Thread(
-        target=recv_loop,
+        target=run_recv_loop,
         kwargs=dict(
             sock=sock,
             stats=stats,
@@ -1051,7 +1191,10 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     try:
         if args.quiet:
-            recv_thread.join()
+            # A timed join keeps Ctrl-C working: on Windows (CPython < 3.14) an
+            # untimed join can't be interrupted, so the handler would never run.
+            while recv_thread.is_alive():
+                recv_thread.join(timeout=0.25)
         else:
             with Live(
                 render_dashboard(
@@ -1105,6 +1248,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         if version_forced and saved_force is not None and iface_name:
             write_force(iface_name, saved_force)
 
+    if rx_errors:
+        console.print(f"[red]receive loop failed:[/] {rx_errors[0]!r}")
+
     # ---- Final summary ----------------------------------------------------
     if args.json:
         summary = {
@@ -1130,6 +1276,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             "last_recv_dscp": stats.last_recv_dscp,
             "last_orig_dscp": stats.last_orig_dscp,
         }
+        if rx_errors:
+            summary["error"] = repr(rx_errors[0])
         print(json.dumps(summary))
     elif args.quiet:
         console.print(
@@ -1140,7 +1288,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             f"reorder={stats.reordered}, gaps={stats.gaps})"
         )
 
-    return 0
+    return 1 if rx_errors else 0
 
 
 if __name__ == "__main__":
